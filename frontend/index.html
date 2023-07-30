@@ -1,0 +1,1394 @@
+<!doctype html>
+
+<html>
+<head>
+    <meta charset="utf-8">
+    <title>WebGPU Practice</title>
+    <style>
+        canvas {
+            margin: auto;
+            display: block;
+            border: 1px solid #000000;
+        }
+        .ingameInput {
+            font-family: 'Courier New', Courier, monospace;
+            font-weight: bold;
+            display: none;
+            position:absolute;
+            left:0px;
+            top:0px;
+            width:200px;
+            z-index: 2;
+        }
+    </style>
+</head>
+<body 
+onkeydown="KeyPressed(event)" 
+onkeyup="KeyReleased(event)"
+onclick="SendMissile(event)"
+onload="Init()"
+>
+    <div id="canvasHolder" style="margin: auto; position:relative">
+        <canvas width="1600" height="900" id="canvasGPU" style="position: absolute; left: 0; top: 0; z-index: 0;"></canvas>
+        <canvas width="1600" height="900" id="canvasUI" style="position: absolute; left: 0; top: 0; z-index: 1;"></canvas>
+
+        <input class="ingameInput" id="serverSelectInput" placeholder="Server Code"></input>
+        <button class="ingameInput" id="serverSelectButton" onclick="FirstContact()">Join Lobby</button>
+
+        <input class="ingameInput" id="lobbyUsernameInput" placeholder="Username..."></input>
+        <input class="ingameInput" id="lobbyShipInput" placeholder="Ship Code..."></input>
+        <button class="ingameInput" id="lobbyStartButton" onclick="PlayerInfo()">Start Play</button>
+        <select class="ingameInput" id="lobbyTeamDropdown">
+            <option value="0">Alpha</option>
+            <option value="1">Beta</option>
+            <option value="2">Gamma</option>
+            <option value="3">Delta</option>
+            <option value="4">Epsilon</option>
+            <option value="5">Iota</option>
+            <option value="6">Kappa</option>
+            <option value="7">Lambda</option>
+            <option value="8">Mu</option>
+            <option value="9">Xi</option>
+        </select>
+
+    </div>
+    <script src="/socket.io/socket.io.js"></script>
+    <script>
+        //User input
+
+        var pressedKeys = new Set();
+
+        //In percentage of the screen from 0 to 1
+        let mouseX = 1;
+        let mouseY = 1;
+
+        function KeyPressed(event) {
+            let keyCode = event.keyCode;
+            pressedKeys.add(event.keyCode);
+            playerUpdateQueued = true;
+        }
+
+        function KeyReleased(event) {
+            let keyCode = event.keyCode;
+            pressedKeys.delete(event.keyCode);
+            playerUpdateQueued = true;
+        }
+
+        //In rendering coordinates
+        let drawMouseX = 1;
+        let drawMouseY = 1;
+
+        function TransferMouseToDrawCoords() {
+            //I am not exactly sure why the spotToHitX had to be scaled by canvasWidth/canvasHeight. 
+            //It kind of makes sense, but why didn't the y have to scale?
+            //I suppose it has something to do with how I modified the shader to handle this stuff.
+            drawMouseX = (canvasWidth/canvasHeight)*(mouseX-0.5)+0.5;
+            drawMouseY = mouseY;
+            shipVectorArray[clientID * shipVectorSize + 10] = (cameraUniformArray[0])/2 + drawMouseX-standardCellSize/2;
+            shipVectorArray[clientID * shipVectorSize + 11] = (cameraUniformArray[1])/2 + drawMouseY-standardCellSize/2
+            playerUpdateQueued = true;
+        }
+
+        function SendMissile(event) {
+            var rect = canvasGPU.getBoundingClientRect();
+            var x = event.clientX - rect.left;
+            var y = event.clientY - rect.top;
+
+            mouseX = x/canvasWidth; //Fix this later to use real canvas size
+            mouseY = 1 - y/canvasHeight;
+
+            TransferMouseToDrawCoords();
+
+            console.log("X" + mouseX + "Y" + mouseY + " <-Screen");
+            console.log("X" + drawMouseX + "Y" + drawMouseY + " <-Render");
+        }
+
+        function Init() { //Called when page loaded
+            SetupCanvas();
+            SetupGPU(); //subsequently calls PostDeviceSetup() and SetupTextures()
+        }
+    </script>
+    <script>
+        class Point {
+            constructor(x, y) {
+                this.x = x;
+                this.y = y;
+            }
+        }
+
+        class Rectangle {
+            x;
+            y;
+            w;
+            h;
+            
+            constructor(x, y, w, h){
+                this.x = x;
+                this.y = y;
+                this.w = w;
+                this.h = h;
+            }
+
+            containsPoint(point) {
+                //Check if x and y of the point are within the rectangle
+                if((point.x > this.x) && (point.x < this.x + this.w) && (point.y > this.y) && (point.y < this.y + this.h)){
+                    return true;
+                }
+                return false;
+            }
+
+            overlapsRectangle(rect){
+                // Takes in a rectangle and checks if it overlaps
+                if(this.x < rect.x + rect.w && this.x + this.w > rect.x && this.y  > rect.y + rect.h && this.y + this.h < rect.y){
+                    return true;
+                }
+                return true;
+            }
+
+        }
+    </script>
+    <script>
+        //Canvas scaling and canvas related functions
+        
+        const canvasGPU = document.getElementById("canvasGPU");
+        const contextGPU = canvasGPU.getContext("webgpu");
+
+        const canvasUI = document.getElementById("canvasUI");
+        const contextUI = canvasUI.getContext("2d");
+        const canvasSizeFraction = 0.8; //Percentage of the screen width the canvas should use
+
+        const canvasHolder = document.getElementById("canvasHolder");
+        let canvasWidth;
+        let canvasHeight;
+
+        const defaultWidth = 1600;
+        const defaultHeight = 900;
+        let sizeFactor;
+
+        let logQueue = []; //A console that is printed to the top left of the canvas
+
+        function DrawHTMLElement(element, rectangle) {
+            //Scales by using the rectangle coordinates as percentages of the screen width and height
+            element.style.left = rectangle.x*canvasWidth + "px";
+            element.style.top = rectangle.y*canvasHeight + "px";
+            element.style.width = rectangle.w*canvasWidth + "px";
+            element.style.height = rectangle.h*canvasHeight + "px";
+            element.style.display = "inline";
+        }
+
+        function HideHTMLElement(element) {
+            element.style.display = "none";
+        }
+
+        function PaintUI(){
+            contextUI.clearRect(0, 0, canvasWidth, canvasHeight);
+            contextUI.font = "bold " + 20 * sizeFactor + "px Courier New";
+            contextUI.textAlign = "center";
+
+            let count = 0;
+            for(var text of logQueue){
+                console.log(text);
+                contextUI.fillText(text, 10, 20 + count * 20);
+                count += 1;
+            }
+            logQueue = [];
+
+            for(let i = 0; i < shipCount; i++) {
+                let gridPosX = shipVectorArray[shipVectorSize*i];
+                let gridPosY = shipVectorArray[shipVectorSize*i+1];
+                gridPosX /= defaultWidth/defaultHeight;
+
+                let outputX = canvasWidth*(gridPosX - cameraUniformArray[0]/(defaultWidth/defaultHeight)/2) + canvasWidth*0.31;
+                let outputY = canvasHeight*(-gridPosY + cameraUniformArray[1]/2) + canvasHeight*0.92;
+
+                if (outputX > canvasWidth * 0.97)
+                    outputX = canvasWidth * 0.97;
+                else if (outputX < canvasWidth * 0.03)
+                    outputX = canvasWidth * 0.03;
+
+                if (outputY > canvasHeight * 0.98)
+                    outputY = canvasHeight * 0.98;
+                else if (outputY < canvasHeight * 0.02)
+                    outputY = canvasHeight * 0.02;
+
+                //let iconSizeX = 6*standardCellSize*canvasWidth/2;
+                //let iconSizeY = 2*standardCellSize*canvasWidth/2;
+
+                //contextUI.drawImage(friendlyHubIcon, outputX+canvasWidth*0.309 - iconSizeX/2, outputY+canvasHeight*0.92 - iconSizeY/2, iconSizeX, iconSizeY);
+
+                if (shipVectorArray[i * shipVectorSize + 4] == shipVectorArray[clientID * shipVectorSize + 4]) {
+                    contextUI.fillStyle = "#0000ff";
+                }
+                else {
+                    contextUI.fillStyle = "#ff0000";
+                }
+                
+
+                //console.log(clientUsernames);
+                contextUI.fillText(clientUsernames[i], outputX, outputY);
+
+                
+            }
+        }
+
+        //HTML UI Elements
+        let serverSelectInput;
+        let serverSelectButton;
+
+        let lobbyUsernameInput;
+        let lobbyShipInput;
+        let lobbyTeamDropdown;
+        let lobbyStartButton;
+
+        function SetupCanvas() {
+            //Canvas and sizeFactor initialization
+            sizeFactor = (document.body.clientWidth / defaultWidth) * canvasSizeFraction; 
+            canvasHolder.style.width = Math.floor(defaultWidth * sizeFactor) + "px";
+            canvasHolder.style.height = Math.floor(defaultHeight * sizeFactor) + "px";
+            canvasUI.width = Math.floor(defaultWidth * sizeFactor);
+            canvasUI.height = Math.floor(defaultHeight * sizeFactor);
+            canvasGPU.width = Math.floor(defaultWidth * sizeFactor);
+            canvasGPU.height = Math.floor(defaultHeight * sizeFactor);
+            canvasWidth = canvasUI.width;
+            canvasHeight = canvasUI.height;
+
+            //Assign HTML elements
+            serverSelectInput = document.getElementById("serverSelectInput");
+            serverSelectButton = document.getElementById("serverSelectButton");
+
+            lobbyUsernameInput = document.getElementById("lobbyUsernameInput");
+            lobbyShipInput = document.getElementById("lobbyShipInput");
+            lobbyTeamDropdown = document.getElementById("lobbyTeamDropdown");
+            lobbyStartButton = document.getElementById("lobbyStartButton");
+
+            //Drawing Server Select Screen
+            contextUI.font = "bold " + 20 * sizeFactor + "px Courier New";
+            contextUI.fillStyle = "#000000";
+            contextUI.fillRect(0,0,canvasWidth,canvasHeight);
+            DrawHTMLElement(serverSelectInput, new Rectangle(0.1, 0.3, 0.8, 0.1));
+            DrawHTMLElement(serverSelectButton, new Rectangle(0.1, 0.5, 0.8, 0.1));
+        }
+
+        function JoinLobby() { //Called if first contact succeeds
+            HideHTMLElement(serverSelectInput);
+            HideHTMLElement(serverSelectButton);
+
+            DrawHTMLElement(lobbyUsernameInput, new Rectangle(0.1, 0.1, 0.8, 0.1));
+            DrawHTMLElement(lobbyShipInput, new Rectangle(0.1, 0.3, 0.8, 0.1));
+            DrawHTMLElement(lobbyTeamDropdown, new Rectangle(0.1, 0.5, 0.8, 0.1));
+            DrawHTMLElement(lobbyStartButton, new Rectangle(0.1, 0.7, 0.8, 0.1));
+        }
+
+        function StartPlay() {
+            HideHTMLElement(lobbyUsernameInput);
+            HideHTMLElement(lobbyShipInput);
+            HideHTMLElement(lobbyTeamDropdown);
+            HideHTMLElement(lobbyStartButton);
+            contextUI.clearRect(0, 0, canvasWidth, canvasHeight);
+            expectedClientLoopTime = Date.now() + UPDATE_INTERVAL;
+            clientLoopTimeout = setTimeout(ClientLoop, UPDATE_INTERVAL);//setInterval(ClientLoop, UPDATE_INTERVAL);
+        }
+    </script>
+    <script>
+        //Variables that the server will change
+        //let shipSchematics;
+        let shipCount = 0;
+
+        //Server info
+        let lobbyPlayerCount = 0;
+        let lobbyPlayerMax = -1;
+        let lobbyMapName = "Unnamed Map";
+
+        let clientID = -1;
+        let clientUsernames = [];
+    </script>
+    <script>
+        /*
+        A note on client-side manipulation:
+
+        It would be very easy to cheat in this game. 
+        You could find out the location of players by changing standardCellSize, use programs to spot perfect launch angles 
+        and modify other client-side stuff.
+
+        */
+        //Game and GPU stuff
+        const standardShipWidth = 16;
+        const standardShipHeight = 8;
+
+        let lockMouse = true;
+        let focusMouse = true;
+
+        const workgroupSize = 8;
+        const thrusterForce = 0.001;
+        const bulletSpeed = 0.006;
+        const standardCellSize = 0.02;
+
+        //Armor ranges from destroyedCellIndex to highestArmorIndex
+        //Each shot lowers block value by 1
+        const destroyedCellIndex = 0; 
+        const highestArmorIndex = 5;
+        const thrusterCellIndex = 7;
+        const gunCellIndex = 6;
+        const hubCellIndex = 8;
+
+        //GPU Variables
+        let adapter; //I wanted to make these consts but I cant without doing excessive promise stuff
+        let device;
+        let canvasFormat;
+        //Vertex information to create a square out of two triangles.
+        //Later could investigate whether index buffers would be more performant, but drawing does not seem to be a current bottleneck.
+        const vertices = new Float32Array([
+            -1, -1, //first triangle
+            1, -1,
+            1,  1,
+
+            -1, -1, //second triangle
+            1,  1,
+            -1,  1,
+        ]);
+
+        const vertexBufferLayout = {
+            arrayStride: 8,
+            attributes: [{
+                format: "float32x2",
+                offset: 0,
+                shaderLocation: 0,
+            }],
+        };
+        let vertexBuffer;
+
+        const blendState = { //This is necessary for the rendering of transparent images
+            color: {
+                srcFactor: "src-alpha",
+                dstFactor: "one-minus-src-alpha",
+                operation: "add"
+            },
+            alpha: {
+                srcFactor: "src-alpha",
+                dstFactor: "one-minus-src-alpha",
+                operation: "add"
+            }
+        };
+
+        //This script used to all run top level using a module but that caused issues since other scripts couldn't reference stuff in a module
+        async function SetupGPU() {
+            if (!navigator.gpu) {
+                throw new Error("WebGPU not supported on this browser.");
+                alert("WebGPU does not work with your browser")
+            }
+
+            adapter = await navigator.gpu.requestAdapter({powerPreference: 'high-performance'});
+            if (!adapter) {
+                throw new Error("No appropriate GPUAdapter found.");
+            }
+            device = await adapter.requestDevice();
+
+            canvasFormat = navigator.gpu.getPreferredCanvasFormat();
+            contextGPU.configure({
+                device: device,
+                format: canvasFormat,
+            });
+
+            vertexBuffer = device.createBuffer({
+                label: "Square vertices",
+                size: vertices.byteLength,
+                usage: GPUBufferUsage.VERTEX | GPUBufferUsage.COPY_DST,
+            });
+            device.queue.writeBuffer(vertexBuffer, 0, vertices);
+
+            await SetupTextures();
+            PostDeviceSetup();
+        }
+
+        const maximumBullets = 256;
+        const maximumShips = 10;
+
+        //Represents the dimensions of a standard ship grid
+        const gridUniformArray = new Float32Array([standardShipWidth, standardShipHeight]);
+        let gridUniformBuffer;
+
+        //Represents the position of the camera
+        const cameraUniformArray = new Float32Array([0, 0]);
+        let cameraUniformBuffer;
+
+        //Create an array of "vectors" representing the active state of each ship.
+        const shipVectorSize = 12;
+        //0  x
+        //1  y
+        //2  xvel
+        //3  yvel
+        //4  team
+        //5  thruster count
+        //6  mass
+        //7  x mass moment
+        //8  y mass moment
+        //9  hub index
+        //10 x aim spot
+        //11 y aim spot
+        let shipVectorArray = new Float32Array(maximumShips * shipVectorSize); //Need to implement different ship sizes later
+        let shipVectorStorage;
+
+        //Create an array of "vectors" representing the active state of each bullet.
+        const bulletVectorSize = 5;
+        //0  x
+        //1  y
+        //2  xvel
+        //3  yvel
+        //4  team
+        let bulletVectorArray = new Float32Array(maximumBullets * bulletVectorSize);
+        let bulletVectorStorage;
+
+        //Massive array of all cells/blocks within all ships. Assumes standard ship size
+        let cellStateArray = new Uint32Array(standardShipWidth * standardShipHeight * maximumShips);
+        let cellStateStorage;
+
+        let cellShaderModule;
+        let computeShaderModule;
+
+        let bindGroupLayout;
+        let pipelineLayout;
+        let cellPipeline;
+        let cellPipelineMissile;
+        let simulationPipeline;
+        let bulletComputePipeline;
+        let bindGroups;
+        let cellStagingBuffer;
+        let bulletStagingBuffer;
+
+        function PostDeviceSetup() {
+            gridUniformBuffer = device.createBuffer({
+                label: "Grid Uniforms",
+                size: gridUniformArray.byteLength,
+                usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+            });
+            device.queue.writeBuffer(gridUniformBuffer, 0, gridUniformArray);
+
+            cameraUniformBuffer = device.createBuffer({
+                label: "Camera Uniforms",
+                size: cameraUniformArray.byteLength,
+                usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,   
+            });
+            device.queue.writeBuffer(cameraUniformBuffer, 0, cameraUniformArray);
+
+            shipVectorStorage = device.createBuffer({
+                label: "Ship storage",
+                //size: shipVectorArray.byteLength,
+                size: 4 * maximumShips * shipVectorSize,
+                usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
+            });
+            device.queue.writeBuffer(shipVectorStorage, 0, shipVectorArray);
+            //console.log("shipVectorArray.byteLength:" + shipVectorArray.byteLength);
+            //console.log("4 * maximumShips * shipVectorSize:" + 4 * maximumShips * shipVectorSize);
+
+            bulletVectorStorage = [
+                device.createBuffer({
+                    label: "Bullet storage A",
+                    //size: bulletVectorArray.byteLength,
+                    size: 4 * maximumBullets * bulletVectorSize,
+                    usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
+                }),
+                device.createBuffer({
+                    label: "Bullet storage B",
+                    //size: bulletVectorArray.byteLength,
+                    size: 4 * maximumBullets * bulletVectorSize,
+                    usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST | GPUBufferUsage.COPY_SRC,
+                })
+            ];
+            device.queue.writeBuffer(bulletVectorStorage[0], 0, bulletVectorArray);
+            device.queue.writeBuffer(bulletVectorStorage[1], 0, bulletVectorArray);
+
+            cellStateStorage = [
+                device.createBuffer({
+                    label: "Cell storage A",
+                    //size: cellStateArray.byteLength,
+                    size: 4 * maximumShips * standardShipWidth * standardShipHeight,
+                    usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
+                }),
+                device.createBuffer({
+                    label: "Cell storage B",
+                    //size: cellStateArray.byteLength,
+                    size: 4 * maximumShips * standardShipWidth * standardShipHeight,
+                    usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST | GPUBufferUsage.COPY_SRC,
+                })
+            ];
+            device.queue.writeBuffer(cellStateStorage[0], 0, cellStateArray);
+            device.queue.writeBuffer(cellStateStorage[1], 0, cellStateArray);
+
+            cellShaderModule = device.createShaderModule({
+            label: "Cell shader",
+            code: `
+                struct VertexInput {
+                    @location(0) pos: vec2f,
+                    @builtin(instance_index) instance: u32,
+                };
+
+                struct VertexOutput {
+                    @builtin(position) pos: vec4f,
+                    @location(1) state: f32,
+                    @location(2) texcoord: vec2f,
+                };
+
+                @group(0) @binding(0) var<uniform> grid: vec2f;
+                @group(0) @binding(1) var<storage> ship: array<f32>;
+                @group(0) @binding(6) var<storage> bullet: array<f32>;
+                @group(0) @binding(2) var<storage> cellState: array<u32>;
+                @group(0) @binding(8) var<uniform> camera: vec2f;
+
+                @vertex
+                fn vertexMain(input: VertexInput) -> VertexOutput  {
+                    let i = f32(input.instance);
+                    let whichShip = ${shipVectorSize}*floor(i/(grid.x*grid.y));
+                    let thisShip = vec2f(ship[u32(whichShip)], ship[u32(whichShip+1)]);
+                    let cell = vec2f(i % grid.x, floor((i-whichShip*grid.x*grid.y/${shipVectorSize}) / (grid.x)));
+                    let state = f32(cellState[input.instance]);
+
+                    let cellOffset = cell * ${standardCellSize} * 2;
+                    var gridPos = ((input.pos + 1) * ${standardCellSize} - 1 + cellOffset) + thisShip*2;
+                    gridPos.x /= ${defaultWidth/defaultHeight};
+
+                    var output: VertexOutput;
+                    output.pos = vec4f(gridPos - vec2f(camera.x/${defaultWidth/defaultHeight}, camera.y), 0, 1);
+                    output.state = state;
+                    output.texcoord = (input.pos + 1)/2;
+                    return output;
+                }
+                
+                @group(0) @binding(4) var ourSampler: sampler;
+                @group(0) @binding(5) var ourTexture: texture_2d_array<f32>;
+
+                @fragment
+                fn fragmentMain(input: VertexOutput) -> @location(0) vec4f {
+                    let state = input.state;
+
+                    let layer = i32(state);
+
+                    return textureSample(ourTexture, ourSampler, input.texcoord, layer );
+                }
+
+                struct VertexInputMissile {
+                    @location(0) pos: vec2f,
+                    @builtin(instance_index) instance: u32,
+                };
+
+                struct VertexOutputMissile {
+                    @builtin(position) pos: vec4f,
+                    @location(1) texcoord: vec2f,
+                };
+
+                @vertex
+                fn vertexMainMissile(input: VertexInputMissile) -> VertexOutputMissile  {
+
+                    let missileIndex = input.instance * 5;
+                    let missileCoords = vec2f(bullet[missileIndex], bullet[missileIndex + 1]);
+
+                    var gridPos = ((input.pos + 1) * ${standardCellSize} - 1) + missileCoords*2;
+                    gridPos.x /= ${defaultWidth/defaultHeight};
+
+                    var output: VertexOutputMissile;
+                    output.pos = vec4f(gridPos - vec2f(camera.x/${defaultWidth/defaultHeight}, camera.y), 0, 1);
+                    output.texcoord = (input.pos + 1)/2;
+                    return output;
+                }
+            
+                @fragment
+                fn fragmentMainMissile(input: VertexOutputMissile) -> @location(0) vec4f {
+                    let state = 3;
+
+                    let layer = i32(state);
+
+                    return textureSample(ourTexture, ourSampler, input.texcoord, layer );
+                }
+            `
+            });
+            
+            computeShaderModule = device.createShaderModule({ //look into quadtree
+            label: "Spaceship simulation compute shader",
+            code: `
+                
+                @group(0) @binding(0) var<uniform> grid: vec2u;
+                @group(0) @binding(1) var<storage> ship: array<f32>;
+                @group(0) @binding(6) var<storage> bulletStateIn: array<f32>;
+                @group(0) @binding(7) var<storage, read_write> bulletStateOut: array<f32>;   
+                @group(0) @binding(2) var<storage> cellStateIn: array<u32>;  
+                @group(0) @binding(3) var<storage, read_write> cellStateOut: array<u32>;   
+            
+                //Implements wrap-around
+                fn cellIndex(cell: vec3u) -> u32 {
+                    //return (cell.y % u32(grid.y)) * u32(grid.x) + (cell.x % u32(grid.x));
+                    return cell.z*${standardShipHeight*standardShipWidth} + cell.y*${standardShipWidth} + cell.x;
+                }
+
+                @compute @workgroup_size(${workgroupSize}, ${workgroupSize}, 1)
+                fn computeMain(@builtin(global_invocation_id) shipBox: vec3u) {
+                    //This compute shader is so bad.
+                    //Ryan told me to look into collision using quadtree something
+            
+                    let whichShip = ${shipVectorSize}*shipBox.z;
+                    let thisShip = vec3f(ship[whichShip], ship[whichShip+1], ship[whichShip+4]);
+
+                    
+
+                    let e = cellIndex(shipBox);
+
+                    if (cellStateOut[e] != ${destroyedCellIndex}) {
+                        for (var i = 0; i < i32(arrayLength(&bulletStateOut)); i+= ${bulletVectorSize}) {
+                            let missile = vec3f(bulletStateOut[i], bulletStateOut[i + 1], bulletStateOut[i + 4]);
+                            let distanceToMissileVector: vec2f = (missile.xy+ ${standardCellSize/2})-(thisShip.xy+f32(${standardCellSize})*(vec2f(shipBox.xy)+f32(0.5)));
+                            
+                            let distanceToMissile = pow( pow(distanceToMissileVector.x, f32(2)) + pow(distanceToMissileVector.y, f32(2)), f32(0.5) );
+                            if (distanceToMissile < f32(${standardCellSize*0.5}) && missile.z != thisShip.z) {
+                                if (cellStateOut[e] <= ${highestArmorIndex} && cellStateOut[e] > ${destroyedCellIndex}) {
+                                    cellStateOut[e] -= 1;
+                                }
+                                else {
+                                    cellStateOut[e] = ${destroyedCellIndex};
+                                }
+                                bulletStateOut[i] = 0;
+                                bulletStateOut[i + 1] = 0;
+                                bulletStateOut[i + 2] = 0;
+                                bulletStateOut[i + 3] = 0;
+                                bulletStateOut[i + 4] = 0;
+                                break;
+                            }
+                        }
+                    }
+
+                    
+                }
+
+                @compute @workgroup_size(${workgroupSize}, 1, 1)
+                fn computeBullet(@builtin(global_invocation_id) bulletBox: vec3u) {
+            
+                    let bulletId = bulletBox.x*${bulletVectorSize};
+
+                    bulletStateOut[bulletId] += bulletStateOut[bulletId + 2];
+                    bulletStateOut[bulletId + 1] += bulletStateOut[bulletId + 3];
+                }
+            `
+            });
+        
+            bindGroupLayout = device.createBindGroupLayout({
+                label: "Complete Bind Group Layout",
+                entries: [{
+                    binding: 0,
+                    visibility: GPUShaderStage.FRAGMENT | GPUShaderStage.VERTEX | GPUShaderStage.COMPUTE,
+                    buffer: {} // Grid uniform buffer
+                }, {
+                    binding: 1,
+                    visibility: GPUShaderStage.FRAGMENT | GPUShaderStage.VERTEX | GPUShaderStage.COMPUTE,
+                    buffer: {type: "read-only-storage"} // Ship storage buffer
+                }, {
+                    binding: 2,
+                    visibility: GPUShaderStage.FRAGMENT | GPUShaderStage.VERTEX | GPUShaderStage.COMPUTE,
+                    buffer: { type: "read-only-storage"} // Cell state buffer
+                }, {
+                    binding: 3,
+                    visibility: GPUShaderStage.COMPUTE,
+                    buffer: { type: "storage"} // Cell state buffer
+                }, {
+                    binding: 4,
+                    visibility: GPUShaderStage.FRAGMENT | GPUShaderStage.VERTEX,
+                    sampler: {}
+                }, {
+                    binding: 5,
+                    visibility: GPUShaderStage.FRAGMENT | GPUShaderStage.VERTEX,
+                    texture: {viewDimension: "2d-array"}
+                }, {
+                    binding: 6,
+                    visibility: GPUShaderStage.FRAGMENT | GPUShaderStage.VERTEX | GPUShaderStage.COMPUTE,
+                    buffer: {type: "read-only-storage"} // missile storage buffer
+                }, {
+                    binding: 7,
+                    visibility: GPUShaderStage.COMPUTE,
+                    buffer: { type: "storage"} // Cell state buffer
+                }, {
+                    binding: 8,
+                    visibility: GPUShaderStage.FRAGMENT | GPUShaderStage.VERTEX,
+                    buffer: {} // Camera uniform buffer
+                }]
+            });
+
+            pipelineLayout = device.createPipelineLayout({
+                label: "Cell Pipeline Layout",
+                bindGroupLayouts: [ bindGroupLayout ],
+            });
+
+            cellPipeline = device.createRenderPipeline({
+                label: "Cell pipeline",
+                layout: pipelineLayout,
+                vertex: {
+                    module: cellShaderModule,
+                    entryPoint: "vertexMain",
+                    buffers: [vertexBufferLayout]
+                },
+                fragment: {
+                    module: cellShaderModule,
+                    entryPoint: "fragmentMain",
+                    targets: [{
+                        format: canvasFormat,
+                        blend: blendState
+                    }]
+                }
+            });
+
+            cellPipelineMissile = device.createRenderPipeline({
+                label: "Cell pipeline",
+                layout: pipelineLayout,
+                vertex: {
+                    module: cellShaderModule,
+                    entryPoint: "vertexMainMissile",
+                    buffers: [vertexBufferLayout]
+                },
+                fragment: {
+                    module: cellShaderModule,
+                    entryPoint: "fragmentMainMissile",
+                    targets: [{
+                        format: canvasFormat,
+                        blend: blendState
+                    }]
+                }
+            });
+
+            simulationPipeline = device.createComputePipeline({
+                label: "Simulation pipeline",
+                layout: pipelineLayout,
+                compute: {
+                    module: computeShaderModule,
+                    entryPoint: "computeMain",
+                }
+            });
+
+            bulletComputePipeline = device.createComputePipeline({
+                label: "Bullet simulation pipeline",
+                layout: pipelineLayout,
+                compute: {
+                    module: computeShaderModule,
+                    entryPoint: "computeBullet",
+                }
+            });
+
+            bindGroups = [
+                device.createBindGroup({
+                    label: "Cell renderer bind group A",
+                    layout: bindGroupLayout, // Updated Line
+                    entries: [{
+                    binding: 0,
+                    resource: { buffer: gridUniformBuffer }
+                    }, {
+                    binding: 1,
+                    resource: { buffer: shipVectorStorage }
+                    }, {
+                    binding: 2,
+                    resource: { buffer: cellStateStorage[0] }
+                    }, {
+                    binding: 3,
+                    resource: { buffer: cellStateStorage[1] }
+                    }, {
+                    binding: 4,
+                    resource: sampler
+                    }, {
+                    binding: 5,
+                    resource: texture.createView({label: "Tile Texture array binding", dimension: "2d-array"})
+                    }, {
+                    binding: 6,
+                    resource: { buffer: bulletVectorStorage[0] }
+                    }, {
+                    binding: 7,
+                    resource: { buffer: bulletVectorStorage[1] }
+                    }, {
+                    binding: 8,
+                    resource: { buffer: cameraUniformBuffer }  
+                    }
+                
+                    ],
+                }),
+                device.createBindGroup({
+                    label: "Cell renderer bind group B",
+                    layout: bindGroupLayout, // Updated Line
+                    entries: [{
+                    binding: 0,
+                    resource: { buffer: gridUniformBuffer }
+                    }, {
+                    binding: 1,
+                    resource: { buffer: shipVectorStorage }
+                    }, {
+                    binding: 2,
+                    resource: { buffer: cellStateStorage[1] }
+                    }, {
+                    binding: 3,
+                    resource: { buffer: cellStateStorage[0] }
+                    }, {
+                    binding: 4,
+                    resource: sampler
+                    }, {
+                    binding: 5,
+                    resource: texture.createView({label: "Tile Texture array binding", dimension: "2d-array"})
+                    }, {
+                    binding: 6,
+                    resource: { buffer: bulletVectorStorage[1] }
+                    }, {
+                    binding: 7,
+                    resource: { buffer: bulletVectorStorage[0] }
+                    }, {
+                    binding: 8,
+                    resource: { buffer: cameraUniformBuffer }  
+                    }
+                
+                    ],
+                })
+            ];
+        
+            cellStagingBuffer = device.createBuffer({
+                size: 4 * maximumShips * standardShipWidth * standardShipHeight,
+                usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST,
+            });
+
+            bulletStagingBuffer = device.createBuffer({
+                size: 4 * maximumBullets * bulletVectorSize,
+                usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST,
+            });
+        }
+
+        async function loadImageBitmap(url) {
+            const res = await fetch(url);
+            const blob = await res.blob();
+            return await createImageBitmap(blob, { colorSpaceConversion: 'none' });
+        }
+
+        let source = [];
+        //texture is a 2d-array texture that stores all the textures with varying z-index
+        //it is not a 3d texture which is a different thing
+        let texture; 
+        let sampler;
+
+        //A series of textures are named Tile${i}.png where i is some number from 0 to numTileTextures-1
+        //These are used for everything so far since I am only drawing squares.
+        //What a waste of the GPU haha
+        const numTileTextures = 18;
+
+        let enemyHubIcon = new Image();
+        enemyHubIcon.src = "EnemyHubIcon.png";
+
+        let friendlyHubIcon = new Image();
+        friendlyHubIcon.src = "FriendlyHubIcon.png";
+
+        async function SetupTextures() {
+            //GPU Textures only
+            for (let i = 0; i < numTileTextures; i++) {
+                source.push(await loadImageBitmap(`Tile${i}.png`));
+            }
+
+            texture = device.createTexture({
+                label: "Tile texture array",
+                format: 'rgba8unorm',
+                size: [source[0].width, source[0].height, numTileTextures], //Compile-time size
+                usage: GPUTextureUsage.TEXTURE_BINDING |
+                    GPUTextureUsage.COPY_DST |
+                    GPUTextureUsage.RENDER_ATTACHMENT,
+            });
+
+            for (let i = 0; i < numTileTextures; i++) {
+                device.queue.copyExternalImageToTexture(
+                    { source: source[i], flipY: true },
+                    { texture: texture, origin: [0, 0, i] },
+                    { width: source[0].width, height: source[0].height},
+                );
+            }
+
+            sampler = device.createSampler({
+                addressModeU: "clamp-to-edge",
+                addressModeV: "clamp-to-edge",
+            });
+        }
+
+        var socket = io(); //May need to specify filepath if not located in root directory.
+
+        function FirstContact() {
+            socket.emit("firstContact", {});
+        }
+
+        socket.on("initialInformation", (lobbyPlayerCountP, lobbyPlayerMaxP) => {
+            console.log("initialInformation");
+            //logQueue.push("initialInformation");
+            lobbyPlayerMax = lobbyPlayerMaxP;
+            lobbyPlayerCount = lobbyPlayerCountP;
+            //clientID = clientIDP;
+            JoinLobby();
+        });
+
+        function PlayerInfo() {
+            const proposedUsername = lobbyUsernameInput.value; //username could be checked for profanity on server side
+            let team = Number(lobbyTeamDropdown.value);
+            socket.emit("playerInfo", { "shipSchematic": lobbyShipInput.value.toString(), "proposedUsername": proposedUsername, "team": team });
+        }
+
+        let readyToSynchronize = false;
+
+        socket.on("synchronizeInformation", (shipVectorArrayP, cellStateArrayP, bulletVectorArrayP, shipCountP, bulletIndexP, stepP, clientIDP, clientUsernamesP, isFirstTime) => {
+            
+            console.log("synchronizeInformation");
+            if (isFirstTime) {
+                step=stepP;
+                StartPlay();
+                readyToSynchronize = true;
+            }
+
+            if (!readyToSynchronize) {
+                return;
+            }
+
+            clientID = clientIDP;
+            console.log(clientUsernamesP);
+            clientUsernames = clientUsernamesP;
+
+            //shipVectorArray = new Float32Array(shipVectorArrayP);
+            //cellStateArray = new Uint32Array(cellStateArrayP);
+            //bulletVectorArray = new Float32Array(bulletVectorArrayP);
+
+            shipVectorArray.set(shipVectorArrayP, 0);
+            cellStateArray.set(cellStateArrayP, 0);
+            bulletVectorArray.set(bulletVectorArrayP, 0);
+
+
+            shipCount = shipCountP;
+            bulletIndex = bulletIndexP;
+
+            shipHubs = [];
+            for (let i = 0; i < shipCount; i += 1) {
+                shipHubs.push(shipVectorArray[shipVectorSize*i + 9]);
+            }
+
+            //console.log("shipCount:" + shipCount);
+            //console.log(shipVectorArray);
+            //console.log(cellStateArray);
+            //console.log(bulletVectorArray);
+
+            device.queue.writeBuffer(shipVectorStorage, 0, shipVectorArray);
+            device.queue.writeBuffer(bulletVectorStorage[0], 0, bulletVectorArray);
+            device.queue.writeBuffer(bulletVectorStorage[1], 0, bulletVectorArray);
+            device.queue.writeBuffer(cellStateStorage[0], 0, cellStateArray);
+            device.queue.writeBuffer(cellStateStorage[1], 0, cellStateArray);
+            
+
+            //Server Reconciliation
+            //https://en.wikipedia.org/wiki/Client-side_prediction
+            const framesToRun = step-stepP;
+            //console.log("framesToRun"+framesToRun);
+            //console.log(Math.abs(framesToRun) >= (SLOW_UPDATE_INTERVAL/UPDATE_INTERVAL))
+
+            if(Math.abs(framesToRun) >= (SLOW_UPDATE_INTERVAL/UPDATE_INTERVAL)) {
+                console.log("Large step difference detected!");
+                step = stepP;
+            }
+            else {
+                for (let i=0; i < framesToRun; i++) {
+                    ClientFrame();
+                    //step++;
+                }
+            }
+        });
+    
+        function PlayerUpdate() {
+            socket.emit("playerUpdate", { 
+                "pressedKeys": Array.from(pressedKeys), 
+                "aimPoint": {"x": shipVectorArray[clientID * shipVectorSize + 10], "y": shipVectorArray[clientID * shipVectorSize + 11]} 
+            });
+        }
+
+        //A smaller update than synchronizeInformation
+        //Only updates shipVectorArray
+        socket.on("updateInformation", (shipVectorArrayP, clientIDP) => {
+            console.log("updateInformation");
+
+            if (!readyToSynchronize) {
+                return;
+            }
+
+            shipVectorArray.set(shipVectorArrayP, 0);
+            clientID = clientIDP;
+            device.queue.writeBuffer(shipVectorStorage, 0, shipVectorArray);
+        });
+
+        socket.on("disconnect", (reason) => {
+            clearTimeout(clientLoopTimeout);
+            readyToSynchronize = false;
+            alert("Something went wrong. The server probably shut down.");
+        });
+
+        function GridConnectednessCheck(grid, startPoints, numShips) {
+            //console.log(pressedKeys);
+            let BFScolors = Array.from(grid); //Using a copy of the ship grid because that narrows out already-destroyed blocks.
+            //We can ignore destroyed and already-discovered blocks when we check for a connection
+            
+            //logQueue.push(startPoints);
+
+            //Version of breadth-first-search / flood fill search
+            for (let i = 0; i < numShips; i++) {
+
+                const gridIndexOffset = i*standardShipWidth*standardShipHeight;
+
+                let BFSqueue = [];
+
+                if(BFScolors[startPoints[i] + gridIndexOffset] == destroyedCellIndex) {
+                    continue;
+                }
+
+                BFSqueue.push(shipIndexToGridLocation(startPoints[i], standardShipWidth));
+                while(BFSqueue.length != 0) {
+                    let u = BFSqueue[0];
+                    let v = new Point(u.x - 1, u.y);
+                    let gridIndex = v.y*standardShipWidth + v.x + gridIndexOffset;
+                    //console.log(gridIndex);
+                    if (v.x >= 0 && BFScolors[gridIndex] != -1 && BFScolors[gridIndex] != destroyedCellIndex) {
+                        BFScolors[gridIndex] = -1; //Setting to -1 since no ship grid block uses that index. This means it is reserved for this
+                        BFSqueue.push(v);
+                    }
+                    v = new Point(u.x + 1, u.y);
+                    gridIndex = v.y*standardShipWidth + v.x + gridIndexOffset;
+                    if (v.x <= standardShipWidth - 1 && BFScolors[gridIndex] != -1 && BFScolors[gridIndex] != destroyedCellIndex) {
+                        BFScolors[gridIndex] = -1;
+                        BFSqueue.push(v);
+                    }
+                    v = new Point(u.x, u.y - 1);
+                    gridIndex = v.y*standardShipWidth + v.x + gridIndexOffset;
+                    if (v.y >= 0 && BFScolors[gridIndex] != -1 && BFScolors[gridIndex] != destroyedCellIndex) {
+                        BFScolors[gridIndex] = -1;
+                        BFSqueue.push(v);
+                    }
+                    v = new Point(u.x, u.y + 1);
+                    gridIndex = v.y*standardShipWidth + v.x + gridIndexOffset;
+                    if (v.y <= standardShipHeight - 1 && BFScolors[gridIndex] != -1 && BFScolors[gridIndex] != destroyedCellIndex) {
+                        BFScolors[gridIndex] = -1;
+                        BFSqueue.push(v);
+                    }
+                    BFSqueue.shift();
+                }
+            }
+
+            return BFScolors;
+        }
+
+        const UPDATE_INTERVAL = 50; // Update every 200ms (5 times/sec)
+        let step = 0; // Track how many simulation steps have been run
+
+        let bulletIndex = 0;
+
+        const SLOW_UPDATE_INTERVAL = 1000; // Make this a multiple of the fast interval so it runs in integer steps
+
+        function totalIndexToShipIndex(index, numShips, totalArrayLength) {
+            
+            //const whereInShip = (index*numShips)%cellStateArray.length;
+            const whereInShip = index%(cellStateArray.length/numShips);
+            //Returns point within ship given the grid information, index of the entire all-ships array, and which ship
+            //const startingIndex = gridXSize*gridYSize*whichShip;
+            return whereInShip;//new Point(whereInShip%gridXSize, Math.floor(whereInShip/gridXSize))
+        }
+
+        function shipIndexToGridLocation(shipIndex, gridWidth) {
+            return new Point(shipIndex%gridWidth, Math.floor(shipIndex/gridWidth));
+        }
+
+        function indexToShip(index, numShips, totalArrayLength) { //Could be combined with function above but doesnt matter.
+            return Math.floor((index*numShips)/totalArrayLength);
+        }
+
+        function shipAndLocationToIndex(whichShip, gridWidth, gridHeight, x, y) {
+            return whichShip*gridWidth*gridHeight + y*gridWidth + x;
+        }
+
+        //Indices within ships that represent hub locations.
+        let shipHubs = [];
+
+        let clientLoopTimeout;
+        let expectedClientLoopTime;
+        function ClientLoop() {
+            //https://stackoverflow.com/questions/29971898/how-to-create-an-accurate-timer-in-javascript
+            const drift = Date.now() - expectedClientLoopTime; //Drift (positive means it took too long)
+            if (drift > UPDATE_INTERVAL) {
+                //Possibly special handling to avoid futile "catch up" run
+            }
+
+            ClientFrame();
+            step++;
+
+            expectedClientLoopTime += UPDATE_INTERVAL;
+            clientLoopTimeout = setTimeout(ClientLoop, Math.max(0, UPDATE_INTERVAL - drift));
+        }
+
+        let playerUpdateQueued = false;
+
+        async function ClientFrame() {
+            if (playerUpdateQueued) {
+                PlayerUpdate();
+                playerUpdateQueued = false;
+            }
+
+            const encoder = device.createCommandEncoder();
+            
+            const computePassBullet = encoder.beginComputePass();
+            computePassBullet.setPipeline(bulletComputePipeline),
+            computePassBullet.setBindGroup(0, bindGroups[0]);
+            
+            computePassBullet.dispatchWorkgroups(Math.ceil((bulletVectorArray.length/bulletVectorSize)/workgroupSize));
+            computePassBullet.end();
+
+            const computePassCells = encoder.beginComputePass();
+            computePassCells.setPipeline(simulationPipeline),
+            computePassCells.setBindGroup(0, bindGroups[0]);
+            
+            computePassCells.dispatchWorkgroups(Math.ceil(standardShipWidth/workgroupSize), Math.ceil(standardShipHeight/workgroupSize), shipCount);
+            computePassCells.end();
+
+            await encoder.copyBufferToBuffer( //could use [0] or [1] not sure which is better performance wise
+                cellStateStorage[1],
+                0,
+                cellStagingBuffer,
+                0,
+                cellStateArray.byteLength
+            );
+
+            await encoder.copyBufferToBuffer( //could use [0] or [1] not sure which is better performance wise
+                bulletVectorStorage[1],
+                0,
+                bulletStagingBuffer,
+                0,
+                bulletVectorArray.byteLength
+            );
+
+            let impartedXVel = 0;
+            let impartedYVel = 0;
+            if(pressedKeys.has(65)){ //a
+                //shipVectorArray[0] -= 0.01;
+                impartedXVel -= 1;//thrusterForce*shipVectorArray[5]/shipVectorArray[6];
+            }
+            if(pressedKeys.has(68)) { //d
+                impartedXVel += 1;
+            }
+            if(pressedKeys.has(87)) { //w
+                impartedYVel += 1;
+            }
+            if(pressedKeys.has(83)){ //s
+                impartedYVel -= 1;
+            }
+            if(pressedKeys.has(32)){ //space
+
+            }
+
+            const impartedVelNormalizer = (impartedXVel**2 + impartedYVel**2)**0.5;
+            impartedXVel *= impartedVelNormalizer*thrusterForce*shipVectorArray[5]/shipVectorArray[6];
+            impartedYVel *= impartedVelNormalizer*thrusterForce*shipVectorArray[5]/shipVectorArray[6];
+
+            if (Math.abs(4*impartedXVel+shipVectorArray[2]) < Math.abs(shipVectorArray[2])) {
+                impartedXVel*=4;
+            }
+            if (Math.abs(4*impartedYVel+shipVectorArray[3]) < Math.abs(shipVectorArray[3])) {
+                impartedYVel*=4;
+            }
+
+            if (Math.abs(shipVectorArray[2]) < 0.05/shipVectorArray[6] && !pressedKeys.has(65) && !pressedKeys.has(68)) { //can probably move this somewhere else
+                shipVectorArray[2] = 0;
+            }
+            if (Math.abs(shipVectorArray[3]) < 0.05/shipVectorArray[6] && !pressedKeys.has(87) && !pressedKeys.has(83)) {
+                shipVectorArray[3] = 0;
+            }
+            shipVectorArray[2] += impartedXVel;
+            shipVectorArray[3] += impartedYVel;
+
+            for (let i = 0; i < shipVectorArray.length; i+= shipVectorSize) {
+                shipVectorArray[i] += shipVectorArray[i + 2];
+                shipVectorArray[i + 1] += shipVectorArray[i + 3];
+                if (!lockMouse) {
+                    shipVectorArray[i + 10] += shipVectorArray[i + 2];
+                    shipVectorArray[i + 11] += shipVectorArray[i + 3];
+                }
+            }
+
+            await device.queue.writeBuffer(shipVectorStorage, 0, shipVectorArray);
+
+            // Start a render pass
+            const pass = encoder.beginRenderPass({
+                colorAttachments: [{
+                    view: contextGPU.getCurrentTexture().createView(),
+                    loadOp: "clear",
+                    clearValue: { r: 0.2, g: 0.1, b: 0.4, a: 1.0 },
+                    storeOp: "store",
+                }]
+            });
+
+            // Draw the grid.
+            pass.setPipeline(cellPipeline);
+            pass.setBindGroup(0, bindGroups[1]);
+            pass.setVertexBuffer(0, vertexBuffer);
+            pass.draw(vertices.length / 2, shipCount* standardShipWidth * standardShipHeight);
+
+            pass.setPipeline(cellPipelineMissile);
+            pass.draw(vertices.length / 2, bulletVectorArray.length/bulletVectorSize); //missile
+
+            // End the render pass and submit the command buffer
+            pass.end();
+            device.queue.submit([encoder.finish()]); //maybe move this to the end to fix stuff
+
+            if (step % (SLOW_UPDATE_INTERVAL/UPDATE_INTERVAL) == 0) {
+                await cellStagingBuffer.mapAsync(
+                    GPUMapMode.READ,
+                    0,
+                    cellStateArray.byteLength
+                );
+
+                const copyCellArrayBuffer = cellStagingBuffer.getMappedRange(0, cellStateArray.byteLength);
+                const cellData = copyCellArrayBuffer.slice();
+                cellStagingBuffer.unmap();
+
+                let cellDataAsArray = new Int32Array(cellData);
+
+                //I wanted to keep GridConnectednessCheck as a function on the entire cellData as opposed to running it once per ship.
+                //This explains the shipHubs parameter
+                let BFScolorsResult = GridConnectednessCheck(cellDataAsArray, shipHubs, shipCount);
+
+                const hubDestoyed = false;
+
+                for (let i = 0; i < shipCount; i += 1) { //disgusting programming
+                    shipVectorArray[shipVectorSize*i + 6] = 1; //The ship storage buffer is not written to from within shaders. So this is the only time mass is updated
+                    shipVectorArray[shipVectorSize*i + 5] = 0; //Same with thruster count
+                    shipVectorArray[shipVectorSize*i + 7] = 0;
+                    shipVectorArray[shipVectorSize*i + 8] = 0;
+                    for (let j = 0; j < BFScolorsResult.length/shipCount; j += 1) {
+                        const offset = standardShipHeight*standardShipWidth*i;
+                        if (BFScolorsResult[j+offset] !== destroyedCellIndex) {
+                            shipVectorArray[shipVectorSize*i + 6] += 1;
+                            const gridLocationOfCell = shipIndexToGridLocation(j, standardShipWidth);
+                            shipVectorArray[shipVectorSize*i + 7] += 1*gridLocationOfCell.x;
+                            shipVectorArray[shipVectorSize*i + 8] += 1*gridLocationOfCell.y;
+                            if (BFScolorsResult[j+offset] !== -1) {
+                                cellDataAsArray[j+offset] = destroyedCellIndex;
+                            }
+                            if (cellDataAsArray[j+offset] == thrusterCellIndex) {
+                                shipVectorArray[shipVectorSize*i + 5] += 1;
+                            }
+                        }
+                    }
+                }
+                //console.log();
+
+                // console.log(dataAsArray[7 + 3 * standardShipWidth]);
+                cellStateArray = cellDataAsArray;
+
+                await device.queue.writeBuffer(cellStateStorage[0], 0, cellStateArray);
+                await device.queue.writeBuffer(cellStateStorage[1], 0, cellStateArray);
+
+                await bulletStagingBuffer.mapAsync(
+                    GPUMapMode.READ,
+                    0,
+                    bulletVectorArray.byteLength
+                );
+
+                const copyBulletArrayBuffer = bulletStagingBuffer.getMappedRange(0, bulletVectorArray.byteLength);
+                const bulletData = copyBulletArrayBuffer.slice();
+                bulletStagingBuffer.unmap();
+
+                let bulletDataAsArray = new Float32Array(bulletData);
+                
+
+                for (let i = 0; i < shipCount; i += 1) { //each ship
+                    //console.log(shipVectorArray);
+                    const shipXPos = shipVectorArray[i*shipVectorSize];
+                    const shipYPos = shipVectorArray[i*shipVectorSize + 1];
+                    const shipXVel = shipVectorArray[i*shipVectorSize + 2];
+                    const shipYVel = shipVectorArray[i*shipVectorSize + 3];
+
+                    const shipTeam = shipVectorArray[i*shipVectorSize + 4];
+                    const xHubPos = shipXPos+(shipVectorArray[i*shipVectorSize + 9]%standardShipWidth)*standardCellSize;
+                    const yHubPos = shipYPos+(Math.floor(shipVectorArray[i*shipVectorSize + 9]/standardShipWidth))*standardCellSize;
+
+                    const spotToHitX = shipVectorArray[i*shipVectorSize + 10];
+                    const spotToHitY = shipVectorArray[i*shipVectorSize + 11];
+
+                    //console.log(spotToHitX);
+                    //console.log(spotToHitY);
+
+                    let xSpawnVel = spotToHitX - xHubPos;
+                    let ySpawnVel = spotToHitY - yHubPos;
+
+                    let velocityNormalizer = Math.pow(Math.pow(xSpawnVel, 2) + Math.pow(ySpawnVel, 2), 0.5);
+
+                    xSpawnVel = 0.01 * xSpawnVel/velocityNormalizer;
+                    ySpawnVel = 0.01 * ySpawnVel/velocityNormalizer;
+                    for (let j = 0; j < standardShipHeight*standardShipWidth; j += 1) { //each index within ship
+                        if (cellStateArray[j + standardShipHeight*standardShipWidth*i] == gunCellIndex) {
+                            //console.log("gun block");
+                            //const locationInGrid = indexToGridLocation(standardShipWidth, i);
+                            const locationInGrid = shipIndexToGridLocation(j, standardShipWidth);
+
+                            const xSpawnPos = shipXPos+locationInGrid.x*standardCellSize;
+                            const ySpawnPos = shipYPos+locationInGrid.y*standardCellSize;
+
+                            if(focusMouse) {
+
+                                const relativeX = spotToHitX - xSpawnPos;
+                                const relativeY = spotToHitY - ySpawnPos;
+
+                                const a = shipXVel**2 + shipYVel**2 - bulletSpeed**2
+                                const b = -2 * ((shipXVel*relativeX) + (shipYVel*relativeY));
+                                const c = relativeX ** 2 + relativeY**2;
+
+                                let t = 0;
+                                if (a == 0) {
+                                    t = -c/b;
+                                }
+                                else {
+                                    const discriminant = (b ** 2) - (4 * a * c);
+                                    if (discriminant >= 0) {
+                                        const sqrtDiscriminant = Math.sqrt(discriminant);
+                                        const t1 = (-b - sqrtDiscriminant) / (2 * a);
+                                        const t2 = (-b + sqrtDiscriminant) / (2 * a);
+                                        t = Math.max(t1, t2);
+                                    } else {
+                                        // The target is not reachable
+                                        // Handle this case accordingly
+                                        console.log("Target is not reachable");
+                                    }
+                                }
+
+
+                                const targetFutureX = spotToHitX - (shipXVel * t);
+                                const targetFutureY = spotToHitY - (shipYVel * t);
+                            
+                                xSpawnVel = targetFutureX - xSpawnPos;
+                                ySpawnVel = targetFutureY - ySpawnPos;
+
+                                velocityNormalizer = Math.pow(Math.pow(xSpawnVel, 2) + Math.pow(ySpawnVel, 2), 0.5);
+
+                                xSpawnVel = bulletSpeed * xSpawnVel/velocityNormalizer + shipXVel;
+                                ySpawnVel = bulletSpeed * ySpawnVel/velocityNormalizer + shipYVel;
+                            }
+
+                            bulletDataAsArray[bulletIndex] = xSpawnPos;
+                            bulletDataAsArray[bulletIndex + 1] = ySpawnPos;
+                            bulletDataAsArray[bulletIndex + 2] = xSpawnVel; //xvel
+                            bulletDataAsArray[bulletIndex + 3] = ySpawnVel; //yvel
+                            bulletDataAsArray[bulletIndex + 4] = shipTeam; //team
+                            bulletIndex+= bulletVectorSize;
+                            if (bulletIndex >= maximumBullets*bulletVectorSize) {
+                                bulletIndex = 0;
+                            }
+                        }
+                    }
+                }
+                bulletVectorArray = bulletDataAsArray;
+                await device.queue.writeBuffer(bulletVectorStorage[0], 0, bulletVectorArray);
+                await device.queue.writeBuffer(bulletVectorStorage[1], 0, bulletVectorArray);
+            }
+            //console.log("clientid:"+clientID);
+            //Camera coordinates are the center of this client's ship. The ships location plus x/y area moments over mass
+            cameraUniformArray[0] = -1+2*(shipVectorArray[clientID*shipVectorSize + 0]+standardCellSize*(shipVectorArray[clientID*shipVectorSize + 7]/shipVectorArray[clientID*shipVectorSize + 6] + 1/2));
+            cameraUniformArray[1] = -1+2*(shipVectorArray[clientID*shipVectorSize + 1]+standardCellSize*(shipVectorArray[clientID*shipVectorSize + 8]/shipVectorArray[clientID*shipVectorSize + 6] + 1/2));
+
+            await device.queue.writeBuffer(cameraUniformBuffer, 0, cameraUniformArray);
+            //logQueue.push("Hello");
+            //logQueue.push(shipVectorArray);
+            PaintUI();
+        }
+
+    </script>
+</body>
+</html>

@@ -1,0 +1,24 @@
+{
+  "name": "webgpu-game",
+  "version": "1.0.0",
+  "description": "Basic multiplayer game using socketio and webgpu",
+  "main": "Server.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1",
+    "start": "node server.js"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/garshaam/WebGPU_game.git"
+  },
+  "author": "Adam Garsha",
+  "license": "ISC",
+  "bugs": {
+    "url": "https://github.com/garshaam/WebGPU_game/issues"
+  },
+  "homepage": "https://github.com/garshaam/WebGPU_game#readme",
+  "dependencies": {
+    "express": "^4.18.2",
+    "socket.io": "^4.7.1"
+  }
+}
