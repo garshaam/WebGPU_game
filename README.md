@@ -4,3 +4,11 @@ Prototype multiplayer game using WebGPU and socket.io. Through this project I le
 This game is far from complete. I plan to edit and finish up the game after the fall semester. If this message is still here by December 2023 it is likely that I have abandoned this project to learn something else.
 
 The code for this project is very bad. It will be compartmentalized, commented, and refactored when I finish it up.
+
+## How to run
+After cloning repository, run the following commands
+
+npm install
+node ./Server.js
+
+load http://localhost:50000 in your browser and voila.
